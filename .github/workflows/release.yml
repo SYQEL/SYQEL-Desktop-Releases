@@ -1,0 +1,271 @@
+# SYQEL Desktop — release workflow for the PUBLIC repo
+# github.com/SYQEL/SYQEL-Desktop-Releases
+#
+# Same shape as SYQEL-Live-Releases/.github/workflows/release.yml: this public
+# repo holds only the workflow and the published artifacts; source stays on
+# private GitLab and is cloned at build time.
+#
+# The two platforms are SEPARATE JOBS, not a matrix, because they are ready at
+# different times: Windows builds on a GitHub-hosted runner from secrets alone,
+# while macOS needs the NDI Apple SDK (no anonymous installer exists) and so
+# needs a self-hosted runner. Either can be run without the other.
+#
+# electron-builder publishes to this repo itself (package.json "publish" already
+# names it) and creates the release as a DRAFT — publishing stays a human act,
+# and publishing is what fires sync-to-r2.yml.
+
+name: release
+
+on:
+  push:
+    tags: ['v*'] # must match package.json version
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Source branch or tag to build'
+        default: main
+      platforms:
+        description: 'Which to build'
+        type: choice
+        default: both
+        options: [both, windows, macos]
+
+env:
+  SOURCE_REPO: gitlab.com/syqel/SYQEL-Desktop-Mac.git
+
+jobs:
+  # ---------------------------------------------------------------- WINDOWS --
+  # Runs anywhere: both SDKs install from public URLs, and Azure Trusted Signing
+  # needs only the three secrets.
+  windows:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["both","windows"]'), github.event.inputs.platforms)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      # env + whitespace strip: a trailing newline in the token malforms the
+      # clone URL ("URL rejected"), which bit Live on its first run.
+      - name: Clone private source
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          rm -rf work && mkdir work
+          TOKEN=$(printf %s "$GITLAB_TOKEN" | tr -d '[:space:]')
+          git clone --depth 1 --branch "${{ github.event.inputs.ref || github.ref_name }}" \
+            "https://oauth2:${TOKEN}@${SOURCE_REPO}" work/desktop
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./work/desktop/package.json').version")
+          [ "$TAG" = "$PKG" ] || { echo "tag v$TAG != package.json $PKG" >&2; exit 1; }
+
+      # Do NOT run the NDI installer: even /VERYSILENT hangs on first install
+      # (a hidden step opens a browser licence page). innoextract unpacks the
+      # payload without executing installer code. Destination is C:\libs\NDI,
+      # which is what engine/binding.gyp probes.
+      - name: Install NDI SDK
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          choco install -y --no-progress innoextract
+          curl.exe -sfL -o ndi-sdk.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          if (!(Test-Path .\ndi-sdk.exe)) { throw 'NDI SDK download failed' }
+          innoextract .\ndi-sdk.exe -d ndi-x --silent
+          New-Item -ItemType Directory -Force C:\libs\NDI | Out-Null
+          Copy-Item -Recurse -Force .\ndi-x\app\* C:\libs\NDI\
+          if (!(Test-Path 'C:\libs\NDI\Include\Processing.NDI.Lib.h')) {
+            Get-ChildItem -Recurse C:\libs\NDI | Select-Object -First 25
+            throw 'NDI layout unexpected — binding.gyp probes C:/libs/NDI/Include'
+          }
+
+      - name: Install Spout SDK binaries
+        shell: pwsh
+        run: |
+          curl.exe -sfL -o spout.zip "https://github.com/leadedge/Spout2/releases/download/2.007.017/Spout-SDK-binaries_2-007-017_1.zip"
+          Expand-Archive spout.zip -DestinationPath C:\libs
+          if (!(Test-Path 'C:\libs\Spout-SDK-binaries\Libs_2-007-017\MD\lib\SpoutLibrary.lib')) {
+            Get-ChildItem -Recurse C:\libs\Spout-SDK-binaries | Select-Object -First 20
+            throw 'Spout SDK layout unexpected'
+          }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      # The repo's .npmrc sets the @syqel registry but never the auth.
+      - name: Authenticate to GitHub Packages
+        shell: bash
+        env:
+          GH_PACKAGES_READ_TOKEN: ${{ secrets.GH_PACKAGES_READ_TOKEN }}
+        run: printf '//npm.pkg.github.com/:_authToken=%s\n' "$GH_PACKAGES_READ_TOKEN" >> work/desktop/.npmrc
+
+      - name: Install dependencies
+        shell: bash
+        run: cd work/desktop && npm ci
+
+      # scripts/azure-sign.js signs via signtool + the Azure Trusted Signing
+      # dlib; with no credentials it skips silently, so a missing secret would
+      # ship an unsigned installer rather than failing. Assert them first.
+      - name: Require signing credentials
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET; do
+            [ -n "${!v}" ] || { echo "$v missing — refusing to ship unsigned" >&2; exit 1; }
+          done
+
+      - name: Fetch Trusted Signing dlib
+        shell: pwsh
+        run: |
+          cd work/desktop
+          nuget install Microsoft.Trusted.Signing.Client -Version 1.0.60 -OutputDirectory tools
+          if (!(Test-Path 'tools\Microsoft.Trusted.Signing.Client.1.0.60\bin\x64\Azure.CodeSigning.Dlib.dll')) {
+            throw 'Trusted Signing dlib not where azure-sign.js expects it'
+          }
+
+      - name: Build, sign, publish draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: cd work/desktop && npm run dist:win -- --publish always
+
+      # A build whose engine silently lost NDI still "succeeds" and ships an app
+      # with no output. Verify the real artifact.
+      - name: Verify engine linked
+        shell: pwsh
+        run: |
+          $node = 'work\desktop\engine\build\Release\syqel_engine.node'
+          if (!(Test-Path $node)) { throw 'native engine missing — stub build' }
+          if (!(Select-String -Path $node -Pattern 'Processing.NDI' -Quiet)) { throw 'NDI not linked' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          retention-days: 14
+          path: |
+            work/desktop/release/*.exe
+            work/desktop/release/*.appx
+            work/desktop/release/latest*.yml
+
+  # ------------------------------------------------------------------ MACOS --
+  # Self-hosted (labels: self-hosted, macOS, desktop) because the NDI Apple SDK
+  # has no anonymously-downloadable installer.
+  #
+  # Signing imports a .p12 into a THROWAWAY keychain rather than unlocking the
+  # login keychain: no machine password anywhere, nothing left behind, and the
+  # same steps would work on a hosted runner if NDI ever becomes fetchable.
+  # Needs two secrets that do not exist yet:
+  #   APPLE_CERTIFICATE_P12       base64 of the Developer ID Application .p12
+  #                               (Keychain Access → export → set a password;
+  #                                then: base64 -i cert.p12 | pbcopy)
+  #   APPLE_CERTIFICATE_PASSWORD  the password given at export
+  macos:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["both","macos"]'), github.event.inputs.platforms)
+    runs-on: [self-hosted, macOS, desktop]
+    permissions:
+      contents: write
+    steps:
+      - name: Clone private source
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          rm -rf work && mkdir work
+          TOKEN=$(printf %s "$GITLAB_TOKEN" | tr -d '[:space:]')
+          git clone --depth 1 --branch "${{ github.event.inputs.ref || github.ref_name }}" \
+            "https://oauth2:${TOKEN}@${SOURCE_REPO}" work/desktop
+
+      - name: Version matches the tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./work/desktop/package.json').version")
+          [ "$TAG" = "$PKG" ] || { echo "tag v$TAG != package.json $PKG" >&2; exit 1; }
+
+      - name: Preflight NDI SDK
+        run: test -d /Library/NDI || { echo 'NDI SDK missing on this runner' >&2; exit 1; }
+
+      - name: Import signing certificate
+        env:
+          P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+          [ -n "$P12" ] || { echo 'APPLE_CERTIFICATE_P12 missing' >&2; exit 1; }
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS=$(uuidgen)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # Without this ACL, codesign prompts for the key and fails headless.
+          security set-key-partition-list -S 'apple-tool:,apple:,codesign:' -s -k "$KC_PASS" "$KC" >/dev/null
+          # Keep the login keychain in the search list so anything else still resolves.
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KC" | grep 'Developer ID Application'
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Authenticate to GitHub Packages
+        shell: bash
+        env:
+          GH_PACKAGES_READ_TOKEN: ${{ secrets.GH_PACKAGES_READ_TOKEN }}
+        run: printf '//npm.pkg.github.com/:_authToken=%s\n' "$GH_PACKAGES_READ_TOKEN" >> work/desktop/.npmrc
+
+      - name: Install dependencies
+        run: cd work/desktop && npm ci
+
+      # Notarization uses three plain strings, so unlike Live there is no key
+      # file path to mangle and they can safely come from secrets.
+      - name: Build, sign, notarize, publish draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cd work/desktop && npm run dist:mac -- --publish always
+
+      - name: Verify slices, NDI and notarization
+        run: |
+          cd work/desktop
+          for pair in "mac-arm64:arm64" "mac:x86_64"; do
+            DIR="${pair%%:*}"; ARCH="${pair##*:}"
+            NODE="release/$DIR/SYQEL Desktop.app/Contents/Resources/app.asar.unpacked/engine/build/Release/syqel_engine.node"
+            file "$NODE" | grep -q "$ARCH" || { echo "$DIR is not $ARCH" >&2; exit 1; }
+            otool -L "$NODE" | grep -q libndi || { echo "$DIR lost NDI" >&2; exit 1; }
+          done
+          spctl -a -vv "release/mac-arm64/SYQEL Desktop.app" 2>&1 | grep -q 'Notarized Developer ID'
+
+      # The throwaway keychain dies with the job, but a self-hosted runner
+      # outlives the job — so remove it explicitly.
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          retention-days: 14
+          path: |
+            work/desktop/release/*.dmg
+            work/desktop/release/*.pkg
+            work/desktop/release/*.zip
+            work/desktop/release/latest-mac.yml
