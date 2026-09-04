@@ -41,7 +41,12 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' ||
       contains(fromJSON('["both","windows"]'), github.event.inputs.platforms)
-    runs-on: windows-latest
+    # NOT windows-latest: that now provisions windows-2025-vs2026, whose
+    # Visual Studio 2026 node-gyp v11 does not recognise — it fails detection
+    # and reports "Could not find any Visual Studio installation to use"
+    # (preceded by a stdio maxBuffer overflow while scraping the unfamiliar
+    # install). windows-2022 carries VS 2022, which node-gyp handles.
+    runs-on: windows-2022
     permissions:
       contents: write
     steps:
@@ -107,6 +112,21 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: cd work/desktop && npm ci
+
+      # Hand node-gyp the toolchain path instead of letting it hunt: its own
+      # search is what overflowed and misreported VS as absent. This also fails
+      # loudly if a future runner image drops the C++ tools, rather than
+      # producing the same misleading "no Visual Studio" error.
+      - name: Point node-gyp at Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) { throw 'vswhere.exe missing — cannot locate a C++ toolchain' }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'No Visual Studio with C++ build tools on this runner' }
+          Write-Host "Visual Studio: $vs"
+          "GYP_MSVS_OVERRIDE_PATH=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GYP_MSVS_VERSION=2022" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # scripts/azure-sign.js signs via signtool + the Azure Trusted Signing
       # dlib; with no credentials it skips silently, so a missing secret would
