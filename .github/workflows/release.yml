@@ -16,9 +16,12 @@
 
 name: release
 
+# Run by hand only. There was also a `push: tags: ['v*']` trigger, but in this
+# repo a tag is CREATED by publishing a release — so it fired after shipping,
+# tried to rebuild what was already live, and failed cloning a tag the source
+# repo does not have (every publish from 2.3.0 on sent a "Run failed" email).
+# A build belongs before the draft, not after the publish.
 on:
-  push:
-    tags: ['v*'] # must match package.json version
   workflow_dispatch:
     inputs:
       ref:
@@ -59,16 +62,8 @@ jobs:
         run: |
           rm -rf work && mkdir work
           TOKEN=$(printf %s "$GITLAB_TOKEN" | tr -d '[:space:]')
-          git clone --depth 1 --branch "${{ github.event.inputs.ref || github.ref_name }}" \
+          git clone --depth 1 --branch "${{ github.event.inputs.ref }}" \
             "https://oauth2:${TOKEN}@${SOURCE_REPO}" work/desktop
-
-      - name: Version matches the tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(node -p "require('./work/desktop/package.json').version")
-          [ "$TAG" = "$PKG" ] || { echo "tag v$TAG != package.json $PKG" >&2; exit 1; }
 
       # Do NOT run the NDI installer: even /VERYSILENT hangs on first install
       # (a hidden step opens a browser licence page). innoextract unpacks the
@@ -205,16 +200,8 @@ jobs:
         run: |
           rm -rf work && mkdir work
           TOKEN=$(printf %s "$GITLAB_TOKEN" | tr -d '[:space:]')
-          git clone --depth 1 --branch "${{ github.event.inputs.ref || github.ref_name }}" \
+          git clone --depth 1 --branch "${{ github.event.inputs.ref }}" \
             "https://oauth2:${TOKEN}@${SOURCE_REPO}" work/desktop
-
-      - name: Version matches the tag
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          PKG=$(node -p "require('./work/desktop/package.json').version")
-          [ "$TAG" = "$PKG" ] || { echo "tag v$TAG != package.json $PKG" >&2; exit 1; }
 
       - name: Preflight NDI SDK
         run: test -d /Library/NDI || { echo 'NDI SDK missing on this runner' >&2; exit 1; }
