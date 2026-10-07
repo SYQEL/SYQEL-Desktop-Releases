@@ -32,6 +32,10 @@ on:
         type: choice
         default: both
         options: [both, windows, macos]
+      released_at:
+        description: 'Release moment, unix seconds (the same value the Mac build used); empty = build time'
+        required: false
+        default: ''
 
 env:
   SOURCE_REPO: gitlab.com/syqel/SYQEL-Desktop-Mac.git
@@ -158,6 +162,7 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          SYQEL_RELEASED_AT: ${{ github.event.inputs.released_at }}
         run: cd work/desktop && npm run dist:win -- --publish always
 
       # A build whose engine silently lost NDI still "succeeds" and ships an app
@@ -258,6 +263,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SYQEL_RELEASED_AT: ${{ github.event.inputs.released_at }}
         run: cd work/desktop && npm run dist:mac -- --publish always
 
       - name: Verify slices, NDI and notarization
