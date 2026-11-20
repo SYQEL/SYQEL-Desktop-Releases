@@ -163,6 +163,9 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           SYQEL_RELEASED_AT: ${{ github.event.inputs.released_at }}
+          # Analytics: without it the app reports nothing (scripts/verify.js refuses).
+          VITE_POSTHOG_KEY: ${{ secrets.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: ${{ secrets.VITE_POSTHOG_HOST }}
         run: cd work/desktop && npm run dist:win -- --publish always
 
       # A build whose engine silently lost NDI still "succeeds" and ships an app
@@ -264,6 +267,9 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           SYQEL_RELEASED_AT: ${{ github.event.inputs.released_at }}
+          # Analytics: without it the app reports nothing (scripts/verify.js refuses).
+          VITE_POSTHOG_KEY: ${{ secrets.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: ${{ secrets.VITE_POSTHOG_HOST }}
         run: cd work/desktop && npm run dist:mac -- --publish always
 
       - name: Verify slices, NDI and notarization
